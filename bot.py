@@ -96,6 +96,12 @@ def main() -> None:
     migrate_legacy_json(database.session_factory, Path.cwd())
     migrate_unified_work(database.session_factory)
 
+    # Load persisted LID<->phone alias mappings from DB so that the alias
+    # registry is available immediately, before the WhatsApp reconciliation
+    # background thread runs.
+    from db.work_store import load_persistent_aliases
+    load_persistent_aliases(database.session_factory)
+
     runtime_config = {
         **config,
         "db_session_factory": database.session_factory,
@@ -189,13 +195,142 @@ def main() -> None:
     @client.event(ConnectedEv)
     def on_connected(_client: NewClient, _event: ConnectedEv):
         log.info("✅ Bot connected to WhatsApp — all features active")
+        try:
+            from neonize.utils import Jid2String
+            runtime_config["bot_jid"] = Jid2String(client.get_me().JID)
+        except Exception as e:
+            log.warning("Could not determine bot JID: %s", e)
         _start_reminder_scheduler(client, runtime_config["db_session_factory"])
+        _reconcile_lid_assignments(client, runtime_config["db_session_factory"])
+
+    def _reconcile_lid_assignments(client: NewClient, session_factory) -> None:
+        """Resolve LID-based assignments to phone JIDs using the live client.
+
+        Always resolves known LIDs and populates the in-memory alias registry
+        (_JID_ALIASES) so that overview() can match assignments regardless of
+        whether the sender arrives as a LID or phone JID.
+        """
+        import threading
+
+        def _run():
+            import time as _time
+            _time.sleep(5)  # let connection fully settle
+            try:
+                from db.work_store import WorkStore, _JID_ALIASES
+                from neonize.utils import build_jid, Jid2String
+                from db.auth import normalize_jid, jid_user
+                from db.models import Assignment, User
+                from sqlalchemy import select
+
+                store = WorkStore(session_factory)
+
+                # Collect all unique user JIDs currently in assignments (any form).
+                with session_factory() as session:
+                    all_assignment_jids = list(dict.fromkeys(
+                        row.user_jid
+                        for row in session.scalars(select(Assignment)).all()
+                        if row.user_jid
+                    ))
+                    # Also collect any user JIDs from the users table that look like LIDs.
+                    all_user_jids = list(dict.fromkeys(
+                        u.jid
+                        for u in session.scalars(select(User)).all()
+                        if u.jid
+                    ))
+
+                # Build a candidate set of LIDs to resolve.
+                # Include both LID-form JIDs from assignments AND try to get LIDs
+                # for phone-form JIDs (reverse lookup) so we cover both directions.
+                lid_to_phone: dict[str, str] = {}
+
+                # Forward: LID -> phone
+                candidate_lids = [j for j in (all_assignment_jids + all_user_jids)
+                                  if j.endswith("@lid")]
+                for lid in dict.fromkeys(candidate_lids):
+                    try:
+                        u, s = lid.split("@", 1)
+                        lid_jid = build_jid(u, s)
+                        pn_jid = client.get_pn_from_lid(lid_jid)
+                        if pn_jid:
+                            phone = normalize_jid(Jid2String(pn_jid))
+                            if phone and phone.endswith("@s.whatsapp.net"):
+                                lid_to_phone[lid] = phone
+                                log.info("📋 LID resolved: %s -> %s", lid, phone)
+                    except Exception as exc:
+                        log.warning("Could not resolve LID %s: %s", lid, exc)
+
+                # Reverse: phone -> LID  (covers the case where DB is already
+                # fully migrated and has zero @lid rows — we still need the
+                # alias so that incoming LID mentions resolve correctly).
+                candidate_phones = [j for j in (all_assignment_jids + all_user_jids)
+                                    if j.endswith("@s.whatsapp.net")]
+                for phone in dict.fromkeys(candidate_phones):
+                    if phone in lid_to_phone.values():
+                        continue  # already covered by forward lookup
+                    try:
+                        u, s = phone.split("@", 1)
+                        pn_jid = build_jid(u, s)
+                        lid_jid = client.get_lid_from_pn(pn_jid)
+                        if lid_jid:
+                            lid = normalize_jid(Jid2String(lid_jid))
+                            if lid and lid.endswith("@lid"):
+                                lid_to_phone[lid] = phone
+                                log.info("📋 Reverse LID resolved: %s -> %s", lid, phone)
+                    except Exception as exc:
+                        log.warning("Could not reverse-resolve phone %s: %s", phone, exc)
+
+                if lid_to_phone:
+                    migrated = store.reconcile_all_lids(lid_to_phone)
+                    log.info("📋 LID reconciliation complete: %d row(s) migrated, "
+                             "%d alias(es) registered.", migrated, len(lid_to_phone))
+
+                else:
+                    log.info("📋 No LID->phone mappings resolved; alias registry empty.")
+            except Exception as exc:
+                log.exception("Error during LID assignment reconciliation: %s", exc)
+
+        thread = threading.Thread(target=_run, name="LIDReconciler", daemon=True)
+        thread.start()
+
 
     dispatch = register_features(client, runtime_config)
 
     @client.event(MessageEv)
     def on_message(_client: NewClient, message: MessageEv):
         info = getattr(message, "Info", None)
+        if not info:
+            return
+        
+        # Dynamically register incoming LID senders to the alias registry
+        # so overview() can find their phone-based assignments.
+        sender_str = getattr(info.MessageSource, "Sender", None)
+        if sender_str:
+            from db.auth import normalize_jid as _nj, jid_user as _ju
+            sender = _nj(sender_str)
+            if sender.endswith("@lid"):
+                from db.work_store import _JID_ALIASES
+                if _ju(sender) not in _JID_ALIASES:
+                    def resolve_in_bg():
+                        try:
+                            import time
+                            time.sleep(1)
+                            from neonize.utils import build_jid, Jid2String
+                            user, server = sender.split("@")
+                            lid_jid = build_jid(user, server)
+                            pn_jid = _client.get_pn_from_lid(lid_jid)
+                            if pn_jid:
+                                phone = _nj(Jid2String(pn_jid))
+                                if phone and phone.endswith("@s.whatsapp.net"):
+                                    _JID_ALIASES[_ju(sender)] = _ju(phone)
+                                    log.info("📋 Dynamically registered LID alias in bg: %s -> %s", sender, phone)
+                                    from db.work_store import save_persistent_alias
+                                    save_persistent_alias(runtime_config["db_session_factory"], _ju(sender), _ju(phone))
+                        except Exception as e:
+                            log.warning("Failed background LID resolve for %s: %s", sender, e)
+                    
+                    import threading
+                    threading.Thread(target=resolve_in_bg, daemon=True).start()
+
         source = getattr(info, "MessageSource", None)
         chat = getattr(source, "Chat", None)
         chat_id = _jid_string(chat) if chat else ""

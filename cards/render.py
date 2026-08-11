@@ -331,6 +331,88 @@ def _build_deco_svg(accent_hex: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _build_original_html(
+    *,
+    card_type: str,
+    name: str,
+    text: str,
+    photo_data_url: str,
+    logo_data_url: str | None,
+) -> str:
+    """Build the unmodified main-branch achievement-card template.
+
+    Natural-language processing may decide what a card says, but it must not
+    change its visual template unless the sender explicitly asks for styling
+    changes.  Keeping this builder separate makes the default output exactly
+    match the original template.
+    """
+    cfg = TYPES.get(card_type, TYPES["custom"])
+    accent = cfg["accent"]
+    sentence_html = _process_highlights(_escape(text))
+    accent_soft = _hex_to_rgba(accent, 0.08)
+    title_glow = _hex_to_rgba(accent, 0.18)
+    deco_svg = _build_deco_svg(accent)
+
+    pill_html = ""
+    if logo_data_url:
+        pill_html = f'<div class="pill logo-pill"><img src="{logo_data_url}" alt="logo" /></div>'
+    elif cfg.get("pill"):
+        pill_html = f'<div class="pill">{_escape(cfg["pill"])}</div>'
+
+    pb_logo_mark = (
+        f'<img class="mark" src="{_PB_LOGO_DATA_URL}" alt="Point Blank mark" />'
+        if _PB_LOGO_DATA_URL
+        else '<div style="font-size:56px;color:#48F80D;line-height:1;">&lt;.&gt;</div>'
+    )
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;700;800&family=JetBrains+Mono:wght@600;700&display=swap">
+<style>
+  :root {{ --accent: {accent}; }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  html, body {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+  body {{
+    width: {CARD_W}px; height: {CARD_H}px; background: #07070d;
+    background-image: radial-gradient(ellipse 70% 50% at 50% 50%, {accent_soft} 0%, transparent 70%);
+    font-family: 'Plus Jakarta Sans', system-ui, sans-serif; color: #fff; position: relative; overflow: hidden;
+  }}
+  .grid-bg, .deco {{ position: absolute; top: 0; left: 0; width: {CARD_W}px; height: {CARD_H}px; pointer-events: none; }}
+  .grid-bg {{ z-index: 0; }} .deco {{ z-index: 1; }}
+  .pb-logo {{ position: absolute; top: 70px; left: 0; right: 0; text-align: center; z-index: 2; font-family: 'JetBrains Mono', monospace; font-weight: 700; letter-spacing: 0.05em; }}
+  .pb-logo .mark {{ width: 220px; height: auto; display: block; margin: 0 auto; }}
+  .pb-logo .row {{ font-size: 32px; margin-top: 20px; }} .pb-logo .point {{ color: #48F80D; }} .pb-logo .blank {{ color: #fff; }}
+  .title {{ position: absolute; top: 230px; left: 0; right: 0; text-align: center; font-size: 86px; font-weight: 800; letter-spacing: -0.02em; text-shadow: 0 0 18px {title_glow}; z-index: 2; }}
+  .avatar {{ position: absolute; left: 50%; top: 380px; transform: translateX(-50%); width: 340px; height: 340px; border-radius: 50%; overflow: hidden; background: #1a1a2e; box-shadow: 0 0 0 6px rgba(255,255,255,0.6); }}
+  .avatar img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+  .person-name {{ position: absolute; top: 770px; left: 0; right: 0; text-align: center; font-size: 60px; font-weight: 700; }}
+  .sentence {{ position: absolute; top: 905px; left: 90px; right: 90px; text-align: center; font-size: 36px; line-height: 1.5; font-weight: 500; }}
+  .highlight {{ color: var(--accent); font-weight: 700; }}
+  .pill {{ position: absolute; bottom: 110px; left: 50%; transform: translateX(-50%); background: #ffffff; color: #15192b; padding: 22px 44px; border-radius: 18px; font-weight: 700; font-size: 30px; white-space: nowrap; box-shadow: 0 10px 26px rgba(0,0,0,0.5); }}
+  .pill.logo-pill {{ padding: 0; background: transparent; box-shadow: none; }}
+  .pill.logo-pill img {{ max-height: 150px; max-width: 480px; object-fit: contain; display: block; margin: 0 auto; border-radius: 12px; }}
+</style>
+</head>
+<body>
+  <svg class="grid-bg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {CARD_W} {CARD_H}" width="{CARD_W}" height="{CARD_H}" aria-hidden="true">
+    <defs><pattern id="grid-pattern" width="52" height="52" patternUnits="userSpaceOnUse" patternTransform="translate(20, 25)"><path d="M 52 0 L 0 0 0 52" fill="none" stroke="#969FBE" stroke-opacity="0.34" stroke-width="1"/></pattern></defs>
+    <rect width="{CARD_W}" height="{CARD_H}" fill="url(#grid-pattern)"/>
+  </svg>
+  {deco_svg}
+  <div class="pb-logo">{pb_logo_mark}<div class="row"><span class="point">Point</span> <span class="blank">Blank</span></div></div>
+  <div class="title">Congratulations</div>
+  <div class="avatar"><img src="{photo_data_url}" alt="profile" /></div>
+  <div class="person-name">{_escape(name)}</div>
+  <div class="sentence">{sentence_html}</div>
+  {pill_html}
+</body>
+</html>"""
+
+
 def _build_html(
     *,
     card_type: str,
@@ -1146,14 +1228,23 @@ async def render_card(
         )
         page_height = TALK_CARD_H
     else:
-        page_html = _build_html(
-            card_type=template_type,
-            name=name,
-            text=text,
-            photo_data_url=photo_data_url,
-            logo_data_url=logo_data_url,
-            design=design_spec,
-        )
+        if design_spec is None:
+            page_html = _build_original_html(
+                card_type=card_type,
+                name=name,
+                text=text,
+                photo_data_url=photo_data_url,
+                logo_data_url=logo_data_url,
+            )
+        else:
+            page_html = _build_html(
+                card_type=template_type,
+                name=name,
+                text=text,
+                photo_data_url=photo_data_url,
+                logo_data_url=logo_data_url,
+                design=design_spec,
+            )
         page_height = CARD_H
 
     from playwright.async_api import async_playwright  # lazy import

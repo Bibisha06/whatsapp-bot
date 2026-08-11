@@ -24,6 +24,13 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# A native WhatsApp mention at the beginning of a caption is rendered as
+# ``@me`` for the sender.  It is commonly used to wake the NLP layer, but a
+# direct command must accept it too.
+_LEADING_MENTION_COMMAND_RE = re.compile(
+    r"^\s*@\S+\s+(?=!card(?:-pdf)?\b)", re.IGNORECASE
+)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -37,6 +44,11 @@ def _get_text(message: MessageEv) -> str:
     elif message.Message.imageMessage and message.Message.imageMessage.caption:
         text = message.Message.imageMessage.caption
     return text.strip()
+
+
+def _get_command_text(message: MessageEv) -> str:
+    """Return a caption/body with one leading bot mention removed."""
+    return _LEADING_MENTION_COMMAND_RE.sub("", _get_text(message)).strip()
 
 
 def _has_image(message: MessageEv) -> bool:
@@ -65,7 +77,7 @@ async def _handle_card_command(
     from cards import render_card, CARD_TYPES
     from features.help import MODULE_HELP
 
-    body = _get_text(message)
+    body = _get_command_text(message)
     chat_jid = message.Info.MessageSource.Chat
     rest = body[len(cmd_prefix):].strip()
     design = getattr(message, "_pbbot_card_design", None)
@@ -190,7 +202,7 @@ def register(client: "NewClient", config: dict) -> callable:
     """Register the card generation feature on the neonize client."""
 
     def on_message(client: "NewClient", message: MessageEv):
-        body = _get_text(message)
+        body = _get_command_text(message)
         lower = body.lower()
         chat_jid = str(message.Info.MessageSource.Chat)
 
