@@ -41,6 +41,13 @@ class AuditLog(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class JidAlias(Base):
+    """Maps linked device LIDs to primary phone JIDs."""
+    __tablename__ = "jid_aliases"
+    lid: Mapped[str] = mapped_column(String(128), primary_key=True)
+    phone: Mapped[str] = mapped_column(String(128), nullable=False)
+
+
 class Event(Base):
     """Future PRD event record; included now so assignments have a stable target."""
     __tablename__ = "events"

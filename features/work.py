@@ -31,8 +31,9 @@ def _format(row: dict, display_names: dict[str, str] | None = None) -> str:
     typ = row["target_type"]
     ident = row.get("event_id") if typ == "event" else row.get("task_id")
     raw_jid = normalize_jid(row.get("user_jid")) if row.get("user_jid") else ""
-    clean_user = (display_names or {}).get(raw_jid) or (jid_user(raw_jid) if raw_jid else None)
-    who = f" @{clean_user}" if clean_user else " unassigned"
+    # Keep a JID-backed token in the text.  _send resolves it to the current
+    # WhatsApp contact name and attaches a real mention to the message.
+    who = f" @+{jid_user(raw_jid)}" if raw_jid else " unassigned"
     due = f" | due {row['due_date'].strftime('%Y-%m-%d')}" if row.get("due_date") else ""
     progress = row.get("status") or "unassigned"
     event_kind = f" | {row['event_type']}/{row['event_category']}" if typ == "event" and row.get("event_type") else ""
@@ -280,8 +281,34 @@ def _target(tokens: list[str], start: int = 0):
     return typ, ident, jid, next_index
 
 
-def _assign_targets(message, remainder: str, inline_jid: str | None, factory) -> list[str]:
-    """Collect every assignee from an inline jid, real mentions, and @subgroup names."""
+def _phone_jid_for_mention(client, chat, jid: str) -> str:
+    """Resolve a WhatsApp LID mention to its real phone JID when available."""
+    normalized = normalize_jid(jid)
+    if not normalized or normalized.endswith("@s.whatsapp.net"):
+        return normalized
+    if not normalized.endswith("@lid"):
+        return normalized
+    from features.subgroups import _resolve_lid_to_pn
+    pn = _resolve_lid_to_pn(client, normalized)
+    if pn != normalized and pn.endswith("@s.whatsapp.net"):
+        return pn
+    try:
+        for participant in getattr(client.get_group_info(chat), "Participants", []) or []:
+            participant_jid = normalize_jid(
+                getattr(participant, "JID", None) or getattr(participant, "LID", None)
+            )
+            if participant_jid != normalized:
+                continue
+            phone = re.sub(r"[^0-9]", "", str(getattr(participant, "PhoneNumber", "") or ""))
+            if phone:
+                return f"{phone}@s.whatsapp.net"
+    except Exception:
+        pass
+    return normalized
+
+
+def _assign_targets(client, chat, message, remainder: str, inline_jid: str | None, factory) -> tuple[list[str], dict[str, str]]:
+    """Collect assignees and map temporary WhatsApp LIDs to phone JIDs."""
     candidates = []
     if inline_jid:
         candidates.append(inline_jid)
@@ -290,11 +317,15 @@ def _assign_targets(message, remainder: str, inline_jid: str | None, factory) ->
     for name in re.findall(r"@([A-Za-z0-9_-]{2,32})", remainder or ""):
         candidates.extend(subgroups.get(name.lower(), []))
     unique = {}
+    aliases: dict[str, str] = {}
     for candidate in candidates:
         normalized = normalize_jid(candidate)
         if normalized:
-            unique.setdefault(jid_user(normalized), normalized)
-    return list(unique.values())
+            canonical = _phone_jid_for_mention(client, chat, normalized)
+            if canonical != normalized:
+                aliases[normalized] = canonical
+            unique.setdefault(jid_user(canonical), canonical)
+    return list(unique.values()), aliases
 
 
 def _reference(typ: str, ident: int, jid: str | None, sender: str, *, use_sender: bool = True) -> str:
@@ -697,9 +728,11 @@ def _handle_work_subcommand(client, chat, message, actor, sender: str, args: str
             if not is_admin:
                 _send(client, chat, "⛔ Only administrators can change assignments.")
                 return True
-            targets = _assign_targets(message, " ".join(tokens[next_index:]), jid, factory)
+            targets, aliases = _assign_targets(client, chat, message, " ".join(tokens[next_index:]), jid, factory)
             if not targets:
                 raise ValueError("mention at least one user or subgroup to assign or unassign")
+            for temporary_jid, phone_jid in aliases.items():
+                store.reconcile_user_identity(temporary_jid, phone_jid)
             if action == "assign":
                 rows = store.assign_many(typ, ident, targets)
                 assigned_jids = [row["user_jid"] for row in rows if row.get("user_jid")]
@@ -805,12 +838,14 @@ def handle(client, message, session_factory) -> bool:
         head = parts[0].split()
         typ = head[0].lower() if head and head[0].lower() in ("event", "task") else "event"
         ident_token = head[1] if typ in ("event", "task") and len(head) > 1 else (head[0] if head else "")
-        targets = _assign_targets(message, parts[1] if len(parts) > 1 else "", None, session_factory)
+        targets, aliases = _assign_targets(client, chat, message, parts[1] if len(parts) > 1 else "", None, session_factory)
         if not ident_token.isdigit() or not targets:
             _send(client, chat, f"Usage: `{command} {typ} <id> | @user`")
             return True
         try:
             store = WorkStore(session_factory)
+            for temporary_jid, phone_jid in aliases.items():
+                store.reconcile_user_identity(temporary_jid, phone_jid)
             if command == "!assign":
                 rows = store.assign_many(typ, int(ident_token), targets)
                 assigned_jids = [row["user_jid"] for row in rows if row.get("user_jid")]

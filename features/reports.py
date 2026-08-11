@@ -4,9 +4,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from db.auth import gate, normalize_jid
+from db.auth import gate, jid_user, normalize_jid
 from db.report_store import ReportStore
 from features.subgroups import _get_mentioned_jids, _get_text
+from features.work import _send
 
 if TYPE_CHECKING:
     from neonize.client import NewClient
@@ -42,6 +43,11 @@ def _table(fields: list[str], rows: list[dict]) -> str:
     return "```\n" + "\n".join(lines) + "\n```"
 
 
+def _owner_label(jid: str) -> str:
+    """Leave a token for the mention-aware sender to resolve at send time."""
+    return f"@+{jid_user(jid)}" if jid else "unassigned"
+
+
 def _cmd_progress(client, chat, store: ReportStore, args: str) -> None:
     tokens = args.split()
     if len(tokens) < 2 or tokens[0].lower() != "event" or not tokens[1].isdigit():
@@ -54,6 +60,7 @@ def _cmd_progress(client, chat, store: ReportStore, args: str) -> None:
     # Build a simple readable list instead of (or alongside) the table
     lines = [f"📊 *{data['event_name']}* — {len(data['rows'])} assignment(s)", ""]
     for row in data["rows"]:
+        row["name"] = _owner_label(row.get("user_jid", ""))
         scope = row.get("scope", "")
         scope_label = f" _(via {scope})_" if scope else ""
         status_label = f"`{row['status']}`"
@@ -63,7 +70,7 @@ def _cmd_progress(client, chat, store: ReportStore, args: str) -> None:
     if data["fields"]:
         lines.append("")
         lines.append(_table([f for f in data["fields"] if f != "task"], data["rows"]))
-    client.send_message(chat, "\n".join(lines))
+    _send(client, chat, "\n".join(lines), [row["user_jid"] for row in data["rows"] if row.get("user_jid")])
 
 
 def _cmd_status_list(client, chat, store: ReportStore, status: str) -> None:
@@ -73,9 +80,10 @@ def _cmd_status_list(client, chat, store: ReportStore, status: str) -> None:
         return
     lines = [f"📋 *{status.replace('_', ' ').title()}* — {len(rows)}"]
     for row in rows:
+        row["name"] = _owner_label(row.get("user_jid", ""))
         missed = f" | missed {row['missed_count']}" if row["missed_count"] else ""
         lines.append(f"• `{row['target_type']} {row['target_id']}` *{row['title']}* — {row['name']}{missed}")
-    client.send_message(chat, "\n".join(lines))
+    _send(client, chat, "\n".join(lines), [row["user_jid"] for row in rows if row.get("user_jid")])
 
 
 def _cmd_summary(client, chat, store: ReportStore) -> None:
@@ -106,10 +114,11 @@ def _cmd_audit(client, chat, store: ReportStore, args: str, mentions: list[str])
         return
     lines = ["🧾 *Audit Log*"]
     for entry in entries:
+        entry["actor"] = _owner_label(entry.get("actor_jid", ""))
         stamp = entry["timestamp"].strftime("%Y-%m-%d %H:%M")
         lines.append(f"• `{entry['operation']}` by {entry['actor']} ({entry['actor_role']}) "
                      f"via {entry['source']} — {entry['result']} _{stamp}_")
-    client.send_message(chat, "\n".join(lines))
+    _send(client, chat, "\n".join(lines), [entry["actor_jid"] for entry in entries if entry.get("actor_jid")])
 
 
 def register(client: "NewClient", config: dict) -> callable:

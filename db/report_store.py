@@ -81,6 +81,7 @@ class ReportStore:
                         seen_fields.append(field)
                 rows.append({
                     "name": self._display(session, assignment.user_jid),
+                    "user_jid": assignment.user_jid,
                     "status": assignment.status,
                     "values": values,
                     "scope": (
@@ -127,6 +128,7 @@ class ReportStore:
                     "target_id": assignment.event_id or assignment.task_id,
                     "title": getattr(target, "name", None) or getattr(target, "title", ""),
                     "name": self._display(session, assignment.user_jid),
+                    "user_jid": assignment.user_jid,
                     "missed_count": assignment.missed_count,
                     "last_update_at": assignment.last_update_at,
                 })
@@ -142,6 +144,7 @@ class ReportStore:
                 query = query.where(AuditLog.operation.startswith(operation))
             return [{
                 "id": row.id, "actor": self._display(session, row.actor_jid),
+                "actor_jid": row.actor_jid,
                 "actor_role": row.actor_role, "operation": row.operation,
                 "source": row.source, "result": row.result, "timestamp": row.timestamp,
             } for row in session.scalars(query.limit(limit)).all()]

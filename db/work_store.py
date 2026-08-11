@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import pathlib
 from datetime import datetime, timezone
 import re
 from typing import Callable
@@ -14,6 +16,51 @@ from .models import Assignment, Event, ProgressRevision, Task, User
 from .schema_store import validate_submission
 
 PROGRESS_STATUSES = frozenset({"pending", "in_progress", "completed", "cancelled"})
+
+# Module-level mapping: jid_user(lid) -> jid_user(phone).
+# Populated by load_persistent_aliases at startup so that
+# overview() can find rows even when the sender arrives as a LID.
+_JID_ALIASES: dict[str, str] = {}
+
+# Legacy persistent file (migrated to DB on startup)
+_ALIASES_FILE = pathlib.Path(__file__).parent.parent / "lid_aliases.json"
+
+
+def load_persistent_aliases(session_factory: Callable[[], Session]) -> None:
+    """Load LID->phone aliases from DB into the in-memory registry.
+    Migrates any existing lid_aliases.json file into the DB."""
+    from .models import JidAlias
+    
+    with session_factory() as session:
+        # Load existing from DB
+        for row in session.scalars(select(JidAlias)).all():
+            _JID_ALIASES[row.lid] = row.phone
+            
+        # Migrate legacy JSON if present
+        try:
+            if _ALIASES_FILE.exists():
+                data = json.loads(_ALIASES_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    for lid, phone in data.items():
+                        if lid not in _JID_ALIASES:
+                            _JID_ALIASES[lid] = phone
+                            session.add(JidAlias(lid=lid, phone=phone))
+                    session.commit()
+                _ALIASES_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def save_persistent_alias(session_factory: Callable[[], Session], lid: str, phone: str) -> None:
+    """Persist a newly discovered LID->phone mapping to the DB."""
+    from .models import JidAlias
+    try:
+        with session_factory() as session:
+            if not session.get(JidAlias, lid):
+                session.add(JidAlias(lid=lid, phone=phone))
+                session.commit()
+    except Exception:
+        pass
 
 
 def normalize_reference(reference: str) -> str:
@@ -59,6 +106,89 @@ class WorkStore:
                          role="member", active=True, created_at=now, updated_at=now))
         session.flush()
         return wanted
+
+    def reconcile_user_identity(self, temporary_jid: str, phone_jid: str) -> None:
+        """Replace known LID-backed assignment identities with a phone JID.
+
+        WhatsApp can send a native mention as an internal LID.  Once the
+        client resolves that LID to a phone JID, migrate non-conflicting
+        assignment rows so future reminders, reports, and mentions target the
+        actual contact rather than the opaque LID.
+        """
+        temporary = normalize_jid(temporary_jid)
+        phone = normalize_jid(phone_jid)
+        if not temporary or not phone or temporary == phone:
+            return
+        with self.session_factory.begin() as session:
+            self._reconcile_in(session, temporary, phone)
+        # Register the alias so overview() can match future messages sent as LIDs.
+        _JID_ALIASES[jid_user(temporary)] = jid_user(phone)
+        save_persistent_alias(self.session_factory, jid_user(temporary), jid_user(phone))
+
+    def reconcile_all_lids(self, lid_to_phone: dict[str, str]) -> int:
+        """Bulk-migrate LID-based assignments to their canonical phone JIDs.
+
+        Called once at startup with a mapping resolved by the live WhatsApp
+        client.  Returns the number of assignment rows migrated.
+        """
+        migrated = 0
+        for lid, phone in lid_to_phone.items():
+            temporary = normalize_jid(lid)
+            canonical = normalize_jid(phone)
+            if not temporary or not canonical or temporary == canonical:
+                continue
+            try:
+                with self.session_factory.begin() as session:
+                    migrated += self._reconcile_in(session, temporary, canonical)
+                # Register alias even if no rows were migrated (they may already
+                # be on the phone JID from a previous run).
+                lid_u = jid_user(temporary)
+                phone_u = jid_user(canonical)
+                if lid_u not in _JID_ALIASES:
+                    _JID_ALIASES[lid_u] = phone_u
+                    save_persistent_alias(self.session_factory, lid_u, phone_u)
+            except Exception:
+                pass
+        return migrated
+
+    @staticmethod
+    def _reconcile_in(session: Session, temporary: str, phone: str) -> int:
+        """Migrate all assignment rows from *temporary* JID to *phone* JID.
+        Returns the number of rows updated.
+        """
+        canonical = WorkStore._ensure_user(session, phone)
+        assignments = session.scalars(
+            select(Assignment).where(Assignment.user_jid == temporary)
+        ).all()
+        updated = 0
+        for assignment in assignments:
+            target_column = (
+                Assignment.event_id
+                if assignment.target_type == "event"
+                else Assignment.task_id
+            )
+            target_id = (
+                assignment.event_id
+                if assignment.target_type == "event"
+                else assignment.task_id
+            )
+            duplicate = session.scalar(
+                select(Assignment).where(
+                    target_column == target_id,
+                    Assignment.user_jid == canonical,
+                )
+            )
+            if duplicate is None:
+                assignment.user_jid = canonical
+                updated += 1
+
+        # Also migrate the legacy task-level assignee_jid field.
+        for task in session.scalars(
+            select(Task).where(Task.assignee_jid == temporary)
+        ).all():
+            task.assignee_jid = canonical
+
+        return updated
 
     @staticmethod
     def _target(session: Session, target_type: str, target_id: int):
@@ -188,7 +318,6 @@ class WorkStore:
         if reference.isdigit():
             row = session.get(Assignment, int(reference))
         else:
-            import re
             match = re.fullmatch(r"(event|task):(\d+)(?:@(.+))?", reference, re.I)
             if not match:
                 raise ValueError(f"Assignment '{reference}' not found.")
@@ -254,30 +383,72 @@ class WorkStore:
 
     def overview(self, *, user_jid: str | None = None, admin: bool = False,
                  status: str | None = None, target_type: str | None = None,
-                 target_id: int | None = None, assignee_jid: str | None = None) -> list[dict]:
+                 target_id: int | None = None, assignee_jid: str | None = None,
+                 also_jids: list[str] | None = None) -> list[dict]:
+        """Return assignment rows matching the given filters.
+
+        ``also_jids`` allows callers to pass additional aliases for the same
+        person (e.g. both the phone JID *and* the LID) so that rows recorded
+        under either form are returned.
+
+        The module-level ``_JID_ALIASES`` registry (populated at startup by
+        ``reconcile_all_lids``) is consulted to expand any LID user-part to its
+        phone user-part automatically, so callers do not need to resolve aliases
+        themselves.
+        """
+        # Build the full set of jid_user() values we'll accept.
+        wanted_users: set[str] = set()
+        for raw in filter(None, [user_jid, assignee_jid, *(also_jids or [])]):
+            u = jid_user(normalize_jid(raw))
+            if not u:
+                continue
+            wanted_users.add(u)
+            # Expand via the alias registry: LID user-part -> phone user-part.
+            if u in _JID_ALIASES:
+                wanted_users.add(_JID_ALIASES[u])
+            # Reverse lookup: phone user-part -> LID user-part.
+            for lid_u, pn_u in _JID_ALIASES.items():
+                if pn_u == u:
+                    wanted_users.add(lid_u)
+
         with self.session_factory() as session:
             rows = session.scalars(select(Assignment).order_by(Assignment.id)).all()
             result = []
             for row in rows:
-                if user_jid and jid_user(row.user_jid) != jid_user(user_jid): continue
-                if not admin and user_jid is None: continue
-                if status and row.status != status: continue
-                if target_type and row.target_type != target_type: continue
-                if target_id is not None and (row.event_id or row.task_id) != target_id: continue
-                if assignee_jid and jid_user(row.user_jid) != jid_user(assignee_jid): continue
-                target = session.get(Event if row.target_type == "event" else Task,
-                                     row.event_id if row.target_type == "event" else row.task_id)
-                if target is None or getattr(target, "deleted_at", None) is not None: continue
-                parent = session.get(Event, target.event_id) if isinstance(target, Task) and target.event_id else None
+                row_user = jid_user(row.user_jid)
+                if wanted_users and row_user not in wanted_users:
+                    continue
+                if not admin and not wanted_users:
+                    continue
+                if status and row.status != status:
+                    continue
+                if target_type and row.target_type != target_type:
+                    continue
+                if target_id is not None and (row.event_id or row.task_id) != target_id:
+                    continue
+                target = session.get(
+                    Event if row.target_type == "event" else Task,
+                    row.event_id if row.target_type == "event" else row.task_id,
+                )
+                if target is None or getattr(target, "deleted_at", None) is not None:
+                    continue
+                parent = (
+                    session.get(Event, target.event_id)
+                    if isinstance(target, Task) and target.event_id
+                    else None
+                )
                 result.append(self._row(row, target, parent, session=session))
             return result
 
     def unassigned(self, *, target_type: str | None = None) -> list[dict]:
         with self.session_factory() as session:
-            output=[]
+            output = []
             if target_type in (None, "event"):
                 for t in session.scalars(select(Event).where(Event.deleted_at.is_(None))).all():
-                    if not self._assignment(session, "event", t.id): output.append({"target_type":"event","event_id":t.id,"task_id":None,"title":t.name,"status":None,"user_jid":None,"lifecycle_status":t.status})
+                    if not self._assignment(session, "event", t.id):
+                        output.append({"target_type": "event", "event_id": t.id, "task_id": None,
+                                        "title": t.name, "status": None, "user_jid": None,
+                                        "lifecycle_status": t.status})
             if target_type in (None, "task"):
                 for t in session.scalars(select(Task).where(Task.deleted_at.is_(None))).all():
                     if not self._assignment(session, "task", t.id):

@@ -756,7 +756,23 @@ def _is_card_design_intent(intent: dict) -> bool:
     return bool(card_type and card_type not in CARD_TYPES)
 
 
-def compile_card_design(intent: dict, text: str) -> tuple[str, dict] | None:
+def _has_explicit_card_style_request(text: str) -> bool:
+    """Return whether the sender, rather than the model, requested styling.
+
+    The normal natural-language path should retain the canonical main-branch
+    templates.  A model may suggest colours or a tone while interpreting a
+    request, but those suggestions are not instructions to redesign the card.
+    """
+    return bool(re.search(
+        r"\b(?:design|redesign|style|styled|theme|themed|visual|layout|look|"
+        r"colour|color|accent|highlight|headline|title|font|background|"
+        r"sarcastic|deadpan|playful|dramatic)\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+
+def compile_card_design(intent: dict, text: str) -> tuple[str, dict | None] | None:
     """Compile an open-ended card design intent into a safe card command/spec."""
     validated = validate_intent(intent)
     if not validated or not _is_card_design_intent(validated):
@@ -845,10 +861,15 @@ def compile_card_design(intent: dict, text: str) -> tuple[str, dict] | None:
         return None
 
     prefix = "!card-pdf" if capability == "card.design_pdf" else "!card"
-    fields = ["custom", name, body]
+    # The original template is selected by the command itself.  Only attach
+    # an override when the sender explicitly asks for a visual change.
+    fields = [base_template, name, body]
     if design.get("logo_url"):
         fields.append(design["logo_url"])
-    return f"{prefix} " + " | ".join(fields), design
+    return (
+        f"{prefix} " + " | ".join(fields),
+        design if _has_explicit_card_style_request(text) else None,
+    )
 
 
 def compile_intent(
@@ -2108,11 +2129,26 @@ def register(client, config: dict) -> Callable:
         explicit_self_target = bool(
             ME_ALIAS_RE.search(body) or EXPLICIT_SELF_TARGET_RE.search(body)
         )
-        visible_mentions = [
-            normalize_jid(jid)
-            for jid in _get_mentioned_jids(message)
-            if normalize_jid(jid) not in self_jids
-        ]
+        from features.subgroups import _resolve_lid_to_pn
+        def _resolve_lid(jid: str) -> str:
+            jid = normalize_jid(jid)
+            if not jid: return ""
+            pn = _resolve_lid_to_pn(client, jid)
+            if pn != jid and pn.endswith("@s.whatsapp.net"):
+                if config.get("db_session_factory"):
+                    try:
+                        from db.work_store import WorkStore
+                        store = WorkStore(config["db_session_factory"])
+                        store.reconcile_user_identity(jid, pn)
+                    except Exception as exc:
+                        log.warning("Failed to reconcile LID: %s", exc)
+            return pn
+
+        visible_mentions = []
+        for jid in _get_mentioned_jids(message):
+            resolved = _resolve_lid(jid)
+            if resolved and resolved not in self_jids and resolved not in visible_mentions:
+                visible_mentions.append(resolved)
         knowledge_context = build_knowledge_context(config, body)
         structured_translation = False
         compiled_steps: list[tuple[str | None, list[str], dict | None, dict | None]] = []
