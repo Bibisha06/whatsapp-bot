@@ -506,7 +506,7 @@ def test_missing_audience_is_sent_through_generic_repair_pass():
     assert len(http.calls) == 1
 
 
-def test_open_ended_card_design_uses_custom_command_and_validated_spec():
+def test_open_ended_card_design_keeps_original_template_without_style_request():
     intent = {
         "capability": "card.design",
         "arguments": {
@@ -527,9 +527,32 @@ def test_open_ended_card_design_uses_custom_command_and_validated_spec():
     )
 
     assert command == (
-        "!card custom | Zodiak | For successfully failing to save your asses at PBCTF 5.0 "
+        "!card hackathon | Zodiak | For successfully failing to save your asses at PBCTF 5.0 "
         "| https://example.com/logo.svg"
     )
+    assert design is None
+
+
+def test_open_ended_card_design_applies_spec_when_style_is_explicitly_requested():
+    intent = {
+        "capability": "card.design",
+        "arguments": {
+            "base_template": "hackathon",
+            "name": "Zodiak",
+            "text": "For successfully failing to save your asses at PBCTF 5.0",
+            "title": "Congratulations, Zodiak!",
+            "accent": "#a855f7",
+            "highlight_terms": ["PBCTF 5.0"],
+            "tone": "sarcastic",
+        },
+    }
+
+    command, design = compile_card_design(
+        intent,
+        "create a sarcastic purple style hackathon card for Zodiak",
+    )
+
+    assert command.startswith("!card hackathon | Zodiak | ")
     assert design["base_template"] == "hackathon"
     assert design["accent"] == "#A855F7"
     assert design["highlight_terms"] == ["PBCTF 5.0"]
@@ -590,7 +613,7 @@ def test_unknown_design_family_falls_back_to_custom_instead_of_help():
     command, design = compile_card_design(intent, "make a congratulations card")
 
     assert command.startswith("!card custom | Zodiak | PBCTF 5.0 legend")
-    assert design["base_template"] == "custom"
+    assert design is None
 
 
 def test_misclassified_unknown_card_type_is_promoted_to_design_mode():
@@ -606,7 +629,7 @@ def test_misclassified_unknown_card_type_is_promoted_to_design_mode():
     command, design = compile_card_design(intent, "make a congratulations card")
 
     assert command == "!card custom | Zodiak | PBCTF 5.0 legend"
-    assert design["base_template"] == "custom"
+    assert design is None
 
 
 def test_invalid_or_missing_model_command_is_rejected_without_guessing():

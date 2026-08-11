@@ -8,7 +8,10 @@ they never manufacture a WhatsApp command or mention context.
 from __future__ import annotations
 
 from typing import Callable
+import re
 
+from db.auth import jid_user, normalize_jid
+from features.work import _send
 
 # Mutating capabilities use this module as their single semantic execution
 # boundary. Legacy command handlers call the same feature-domain services.
@@ -26,6 +29,141 @@ def _jid_text(value) -> str:
         return f"{user}@{server}"
     raw = str(value or "")
     return raw if "@" in raw else ""
+
+
+def _object_name(obj) -> str:
+    """Extract a transient WhatsApp/contact name from a Neonize object."""
+    if obj is None:
+        return ""
+    for field in (
+        "DisplayName", "PushName", "Pushname", "FullName", "Name",
+        "Notify", "VerifiedName", "BusinessName", "ShortName",
+    ):
+        value = getattr(obj, field, None)
+        if value is None:
+            continue
+        if getattr(value, "User", None) and getattr(value, "Server", None):
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    for field in ("Contact", "User", "Info"):
+        nested = getattr(obj, field, None)
+        if nested is not None and nested is not obj:
+            name = _object_name(nested)
+            if name:
+                return name
+    return ""
+
+
+def _phone_for_jid(client, jid) -> str:
+    normalized = normalize_jid(_jid_text(jid))
+    if normalized.endswith("@s.whatsapp.net"):
+        return normalized
+    if normalized.endswith("@lid"):
+        from features.subgroups import _resolve_lid_to_pn
+        pn = _resolve_lid_to_pn(client, normalized)
+        if pn != normalized and pn.endswith("@s.whatsapp.net"):
+            return pn
+    return ""
+
+
+def _get_display_name_map(client, chat, jids):
+    """Resolve current WhatsApp/contact names only for outgoing formatting.
+
+    Names are never persisted in the application database. The group
+    Participant object currently returns an empty DisplayName in this bot's
+    session, so contact/user-info APIs are also attempted.
+    """
+    wanted = []
+    for jid in jids:
+        value = normalize_jid(_jid_text(jid))
+        if value and value not in wanted:
+            wanted.append(value)
+    if not wanted:
+        return {}
+
+    names = {}
+    phone_by_jid = {jid: _phone_for_jid(client, jid) for jid in wanted}
+
+    try:
+        info = client.get_group_info(chat)
+        participants = getattr(info, "Participants", []) or []
+        for participant in participants:
+            raw_jid = getattr(participant, "JID", None) or getattr(participant, "LID", None)
+            participant_jid = normalize_jid(_jid_text(raw_jid))
+            if not participant_jid:
+                continue
+            name = _object_name(participant)
+            phone_raw = re.sub(r"[^0-9]", "", str(getattr(participant, "PhoneNumber", "") or ""))
+            phone_jid = normalize_jid(f"{phone_raw}@s.whatsapp.net") if phone_raw else ""
+            if name:
+                if participant_jid in wanted:
+                    names[participant_jid] = name
+                if phone_jid in wanted:
+                    names[phone_jid] = name
+            if phone_jid:
+                for jid in wanted:
+                    if jid.endswith("@lid") and phone_by_jid.get(jid) == phone_jid:
+                        if name:
+                            names[jid] = name
+    except Exception as exc:
+        # Name lookup must never break the actual operation.
+        pass
+
+    unresolved = [jid for jid in wanted if jid not in names]
+    for method_name in ("get_contact", "get_contact_info"):
+        method = getattr(client, method_name, None)
+        if not callable(method):
+            continue
+        for jid in unresolved:
+            candidates = [jid]
+            phone = phone_by_jid.get(jid)
+            if phone and phone not in candidates:
+                candidates.append(phone)
+            for candidate in candidates:
+                try:
+                    name = _object_name(method(candidate))
+                    if name:
+                        names[jid] = name
+                        break
+                except Exception:
+                    pass
+        unresolved = [jid for jid in wanted if jid not in names]
+        if not unresolved:
+            break
+
+    get_user_info = getattr(client, "get_user_info", None)
+    if callable(get_user_info) and unresolved:
+        query = []
+        for jid in unresolved:
+            query.append(jid)
+            phone = phone_by_jid.get(jid)
+            if phone and phone not in query:
+                query.append(phone)
+        try:
+            for obj in list(get_user_info(*query) or []):
+                returned = normalize_jid(_jid_text(getattr(obj, "JID", None)))
+                name = _object_name(obj)
+                if not name:
+                    continue
+                for jid in wanted:
+                    if jid == returned or phone_by_jid.get(jid) == returned:
+                        names[jid] = name
+        except Exception:
+            pass
+
+    return names
+
+
+def _mention_text(client, chat, jids):
+    """Return display-name mention text while preserving real JIDs for metadata."""
+    jids = list(dict.fromkeys(_jid_text(jid) for jid in jids if _jid_text(jid)))
+    names = _get_display_name_map(client, chat, jids)
+    return ", ".join(
+        f"@{names.get(jid, jid_user(jid))}"
+        for jid in jids
+    )
 
 
 def _authorize_tool(factory, sender, client, chat, capability):
@@ -170,7 +308,10 @@ def execute_whatsapp_reply(client, message, intent: dict, factory) -> dict | Non
     text = str(intent.get("arguments", {}).get("text") or "").strip()
     if not text:
         return None
-    client.reply_message(text, message.Message)
+    try:
+        client.reply_message(text, message)
+    except Exception:
+        client.send_message(chat, text)
     return {"replied": True, "chat": _jid_text(chat), "text": text}
 
 
@@ -1072,7 +1213,7 @@ def execute_direct_tool(
     if capability in {"whatsapp.send_contact", "whatsapp.send_poll"}:
         return execute_whatsapp_message_primitive(client, message, intent, factory)
     if capability in {"work.my", "work.overview", "work.list_event_tasks"}:
-        return execute_work_read(client, message, intent, factory)
+        return execute_work_read(client, message, intent, factory, resolve_target=resolve_target)
     handler = handlers.get(capability)
     if handler is None or capability not in TOOL_SPECS:
         return None
@@ -1090,7 +1231,7 @@ def _structured_work_row(row: dict) -> dict:
     return result
 
 
-def execute_work_read(client, message, intent: dict, factory) -> dict | None:
+def execute_work_read(client, message, intent: dict, factory, resolve_target=None) -> dict | None:
     """Read work through domain stores and expose structured rows to later steps."""
     source = message.Info.MessageSource
     chat = source.Chat
@@ -1104,12 +1245,93 @@ def execute_work_read(client, message, intent: dict, factory) -> dict | None:
 
     sender = source.Sender
     arguments = intent.get("arguments", {})
-    status = str(arguments.get("status") or "").strip() or None
+    _raw_status = str(arguments.get("status") or "").strip().lower()
+    # Only accept statuses that actually exist in the DB schema.
+    # The NL model sometimes sets status="assigned" when the user says
+    # "assigned to @X" — discard those so the query isn't filtered to nothing.
+    from db.work_store import PROGRESS_STATUSES
+    status = _raw_status if _raw_status in PROGRESS_STATUSES else None
     store = WorkStore(factory)
+
+    # Build visible_mentions from the message protobuf (same logic as the NL compiler).
+    from features.subgroups import _get_mentioned_jids, _resolve_lid_to_pn
+    from db.auth import normalize_jid, jid_user
+    _self_jids = {normalize_jid(sender)}
+    try:
+        from neonize.utils import Jid2String
+        bot_jid = Jid2String(client.get_me().JID)
+        if bot_jid:
+            _self_jids.add(normalize_jid(bot_jid))
+    except Exception:
+        pass
+        
+    visible_mentions = []
+    for _jid in _get_mentioned_jids(message):
+        _resolved = _resolve_lid_to_pn(client, normalize_jid(_jid))
+        if _resolved and _resolved not in _self_jids and _resolved not in visible_mentions:
+            visible_mentions.append(_resolved)
+
+    # Resolve LID/phone aliases for the target user using the persistent cache.
+    def _alias_jids(jid: str) -> list[str]:
+        """Return [jid] plus its LID or phone counterpart if known."""
+        from db.auth import normalize_jid as _nj, jid_user as _ju
+        jid = _nj(jid)
+        aliases = [jid]
+        try:
+            from db.work_store import _JID_ALIASES
+            user_part = _ju(jid)
+            
+            # Forward: LID -> Phone
+            if jid.endswith("@lid"):
+                if user_part in _JID_ALIASES:
+                    aliases.append(f"{_JID_ALIASES[user_part]}@s.whatsapp.net")
+            
+            # Reverse: Phone -> LID
+            elif jid.endswith("@s.whatsapp.net"):
+                for lid_u, phone_u in _JID_ALIASES.items():
+                    if phone_u == user_part:
+                        aliases.append(f"{lid_u}@lid")
+        except Exception:
+            pass
+        return aliases
+
     try:
         if capability == "work.list_event_tasks":
             event_id = arguments.get("event_id", arguments.get("target_id"))
+            if not str(event_id or "").isdigit() and resolve_target:
+                ref = resolve_target({"target_type": "event", **arguments})
+                if ref and ref.startswith("event "):
+                    event_id = ref.split(" ", 1)[1]
+            if not str(event_id or "").isdigit() and factory:
+                from db.event_store import EventStore
+                name_query = arguments.get("event_name") or arguments.get("target_name") or arguments.get("name") or arguments.get("event")
+                if name_query:
+                    events = EventStore(factory).list_events(status="active")
+                    for e in events:
+                        if e["name"].lower() == str(name_query).lower() or str(name_query).lower() in e["name"].lower():
+                            event_id = e["id"]
+                            break
             if not str(event_id or "").isdigit():
+                # If the NL model misrouted a user-workload query to this
+                # capability (e.g. "list all tasks of @Shuvam"), fall back
+                # gracefully to a workload query for the mentioned users.
+                if visible_mentions:
+                    # Re-route to user workload
+                    target_jid = visible_mentions[0]
+                    all_aliases = _alias_jids(target_jid)
+                    rows = store.overview(
+                        user_jid=all_aliases[0],
+                        also_jids=all_aliases[1:],
+                        status=status,
+                    )
+                    heading = "📌 *Workload*"
+                    all_work_jids = [row["user_jid"] for row in rows if row.get("user_jid")]
+                    display_names = _get_display_name_map(client, chat, all_work_jids)
+                    from features.work import _format as _fmt
+                    lines = [heading]
+                    lines.extend(_fmt(row, display_names) for row in rows)
+                    _send(client, chat, "\n".join(lines) if rows else heading + "\n\n📭 No matching work.", mention_jids=all_work_jids)
+                    return {"rows": [_structured_work_row(row) for row in rows], "row_count": len(rows)}
                 raise ValueError("event reference is required")
             tasks = TaskStore(factory).list_for_event(int(event_id), status=status)
             rows = []
@@ -1126,18 +1348,53 @@ def execute_work_read(client, message, intent: dict, factory) -> dict | None:
                     "assignees": [row["user_jid"] for row in assignments],
                 })
             lines = [f"🧩 *Tasks under event {event_id}*"]
+            all_assignee_jids = [jid for row in rows for jid in row["assignees"]]
+            display_names = _get_display_name_map(client, chat, all_assignee_jids)
             lines.extend(
                 f"• `task {row['task_id']}` *{row['title']}* — `{row['status']}` "
                 f"({row['priority']}) | "
-                + (", ".join(f"@{jid.split('@', 1)[0]}" for jid in row["assignees"]) or "unassigned")
+                + (", ".join(
+                    f"@{display_names.get(jid, jid_user(jid))}"
+                    for jid in row["assignees"]
+                ) or "unassigned")
                 for row in rows
             )
-            client.send_message(chat, "\n".join(lines) if rows else f"📭 No tasks found under event {event_id}.")
+            _send(client, chat, "\n".join(lines) if rows else f"📭 No tasks found under event {event_id}.", mention_jids=all_assignee_jids)
             return {"tasks": rows, "task_count": len(rows), "event_id": int(event_id)}
 
         if capability == "work.my":
-            rows = store.overview(user_jid=sender, status=status)
-            heading = "📌 *My Workload*"
+            # "work.my" shows the sender's own workload.  The audience argument
+            # may contain a mentioned user when the sender asks about someone
+            # else (e.g. "@me show tasks for @Shuvam").
+            audience_jids = arguments.get("audience") or []
+            if isinstance(audience_jids, str):
+                audience_jids = [audience_jids]
+            if not audience_jids and visible_mentions:
+                audience_jids = list(visible_mentions)
+            if audience_jids:
+                # Admin asking about someone else's workload.
+                target_jid = audience_jids[0]
+                all_aliases = _alias_jids(target_jid)
+                rows = store.overview(
+                    user_jid=all_aliases[0],
+                    also_jids=all_aliases[1:],
+                    status=status,
+                )
+                heading = f"📌 *Workload*"
+            else:
+                norm_sender = normalize_jid(sender)
+                all_aliases = _alias_jids(norm_sender)
+                import logging
+                logging.getLogger("features.natural_language").info(
+                    "work.my self-query debugging: sender=%s norm=%s aliases=%s",
+                    sender, norm_sender, all_aliases
+                )
+                rows = store.overview(
+                    user_jid=all_aliases[0],
+                    also_jids=all_aliases[1:],
+                    status=status,
+                )
+                heading = "📌 *My Workload*"
         else:
             target_type = arguments.get("target_type")
             target_id = arguments.get("target_id")
@@ -1151,9 +1408,11 @@ def execute_work_read(client, message, intent: dict, factory) -> dict | None:
             if actor.role == "admin":
                 rows += store.unassigned(target_type=target_type)
             heading = "📋 *Work Overview*"
+        all_work_jids = [row["user_jid"] for row in rows if row.get("user_jid")]
+        display_names = _get_display_name_map(client, chat, all_work_jids)
         lines = [heading]
-        lines.extend(_format(row) for row in rows)
-        client.send_message(chat, "\n".join(lines) if rows else heading + "\n\n📭 No matching work.")
+        lines.extend(_format(row, display_names) for row in rows)
+        _send(client, chat, "\n".join(lines) if rows else heading + "\n\n📭 No matching work.", mention_jids=all_work_jids)
         return {"rows": [_structured_work_row(row) for row in rows], "row_count": len(rows)}
     except Exception as exc:
         client.send_message(chat, f"⚠️ {exc}")
@@ -1308,7 +1567,11 @@ def execute_collection_mutation(
                 client.send_message(chat, f"⚠️ Subgroup *@{collection}* does not exist.")
                 return None
             members_list = subgroups[collection]
-            mention_parts = [f"@{jid.split('@')[0]}" for jid in members_list]
+            display_names = _get_display_name_map(client, chat, members_list)
+            mention_parts = [
+                f"@{display_names.get(jid, jid_user(jid))}"
+                for jid in members_list
+            ]
             text = f"*@{collection}* — {len(members_list)} member(s)\n\n" + "\n".join(f"  • {m}" for m in mention_parts)
             client.send_message(chat, text)
             return {"collection": collection, "members": members_list, "member_count": len(members_list)}
@@ -1545,7 +1808,7 @@ def execute_work_assignment(
 
         if action == "assign":
             rows = store.assign_many(target_type, int(target_id), targets)
-            assigned = [row["user_jid"].split("@", 1)[0] for row in rows]
+            assigned_jids = [row["user_jid"] for row in rows]
             audit(
                 factory,
                 actor,
@@ -1553,13 +1816,15 @@ def execute_work_assignment(
                 "natural_language",
                 {"target_id": int(target_id), "users": targets},
             )
-            client.send_message(
+            _send(
+                client,
                 chat,
                 f"✅ Assigned {target_type} {target_id} to "
-                + ", ".join(f"@{name}" for name in assigned)
+                + _mention_text(client, chat, assigned_jids)
                 + ".",
+                mention_jids=assigned_jids,
             )
-            return {"target": f"{target_type} {target_id}", "action": action, "members": assigned}
+            return {"target": f"{target_type} {target_id}", "action": action, "members": assigned_jids}
         else:
             removed = store.unassign_many(target_type, int(target_id), targets)
             audit(

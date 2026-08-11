@@ -132,6 +132,41 @@ def _reply(client: "NewClient", chat_jid, text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# JID Resolution Helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_lid_to_pn(client: "NewClient", jid: str) -> str:
+    """Convert a WhatsApp LID to a Phone JID."""
+    normalized = normalize_jid(jid)
+    if not normalized or not normalized.endswith("@lid"):
+        return normalized
+    try:
+        from db.work_store import _JID_ALIASES
+        from db.auth import jid_user
+        user_part = jid_user(normalized)
+        if user_part in _JID_ALIASES:
+            return f"{_JID_ALIASES[user_part]}@s.whatsapp.net"
+    except Exception:
+        pass
+    return normalized
+
+def _resolve_pn_to_lid(client: "NewClient", jid: str) -> str:
+    """Convert a WhatsApp Phone JID to an LID."""
+    normalized = normalize_jid(jid)
+    if not normalized or not normalized.endswith("@s.whatsapp.net"):
+        return normalized
+    try:
+        from db.work_store import _JID_ALIASES
+        from db.auth import jid_user
+        user_part = jid_user(normalized)
+        for lid_u, phone_u in _JID_ALIASES.items():
+            if phone_u == user_part:
+                return f"{lid_u}@lid"
+    except Exception:
+        pass
+    return normalized
+
+# ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 
