@@ -578,8 +578,8 @@ def _target_arguments(arguments: dict, text: str = "") -> dict:
         result.setdefault("target_id", t_id)
     elif isinstance(raw_target, str) and raw_target.casefold() in {"event", "task"}:
         result.setdefault("target_type", raw_target.casefold())
-    elif isinstance(raw_target, (int, float)) or (isinstance(raw_target, str) and raw_target.strip().isdigit()):
-        result.setdefault("target_id", raw_target)
+    elif isinstance(raw_target, str) and raw_target.strip() and raw_target.casefold() not in {"event", "task"} and not raw_target.strip().isdigit():
+        result.setdefault("target_name", raw_target.strip())
 
     if not result.get("target_type"):
         for key, target_type in (("event_id", "event"), ("task_id", "task")):
@@ -647,7 +647,11 @@ def _resolve_target_reference(factory, arguments: dict) -> str | None:
         if isinstance(target_id, str) and target_id.strip().isdigit():
             return f"{target_type} {int(target_id.strip())}"
 
-    requested = arguments.get("target_name") or (str(target_id) if target_id and not str(target_id).isdigit() else None)
+    requested = (
+        arguments.get("target_name")
+        or (raw_target if isinstance(raw_target, str) and raw_target.casefold() not in {"event", "task"} and not raw_target.strip().isdigit() else None)
+        or (str(target_id) if target_id and not str(target_id).isdigit() else None)
+    )
     if not isinstance(requested, str) or not requested.strip() or not factory:
         return None
 
@@ -693,6 +697,23 @@ def _canonical_task_status(value: str) -> str:
         "cancelled": "cancelled",
         "todo": "todo",
         "done": "done",
+    }.get(value.casefold().strip(), value.casefold().strip())
+
+
+def _canonical_work_status(value: str) -> str:
+    """Map user-friendly synonyms to the work-progress store vocabulary."""
+    return {
+        "todo": "pending",
+        "unstarted": "pending",
+        "not started": "pending",
+        "open": "pending",
+        "done": "completed",
+        "complete": "completed",
+        "finished": "completed",
+        "in progress": "in_progress",
+        "wip": "in_progress",
+        "ongoing": "in_progress",
+        "canceled": "cancelled",
     }.get(value.casefold().strip(), value.casefold().strip())
 
 
@@ -903,9 +924,11 @@ def compile_intent(
         )
         if action == "my":
             status = _arg_text(arguments, "status")
+            status = _canonical_work_status(status)
             return "!my" + (f" {status}" if status else "")
         if action == "overview":
             status = _arg_text(arguments, "status")
+            status = _canonical_work_status(status)
             target = _resolve_target_reference(factory, target_arguments) if target_arguments.get("target_name") or target_arguments.get("target_id") else ""
             return "!work" + (f" {status}" if status else f" {target}" if target else "")
         if action == "create_event":
@@ -969,20 +992,35 @@ def compile_intent(
                         f"!work {action} {target} | "
                         + " ".join(collection_tokens)
                     )
-                return f"!work {action} {target}{suffix}"
             field = _arg_text(arguments, "field")
             value = _arg_text(arguments, "value")
+            if field.lower() in ("status", "state", "progress_status"):
+                norm_val = _canonical_work_status(value)
+                if norm_val in ("in_progress", "start"):
+                    return f"!work start {target}{suffix}"
+                elif norm_val in ("completed", "done", "complete"):
+                    return f"!work complete {target}{suffix}"
+                elif norm_val:
+                    return f"!work set-status {target} {norm_val}"
             return f"!work update {target} {field} {value}" if field and value else None
         if action == "edit":
             revision_id = _arg_text(arguments, "revision_id")
             value = _arg_text(arguments, "value")
             return f"!work edit {revision_id} {value}" if revision_id and value else None
-        if action == "set_lifecycle":
+        if action in {"set_lifecycle", "set_status"}:
             target = _resolve_target_reference(factory, target_arguments)
-            status = _arg_text(arguments, "status")
-            if not target or not status or not target.startswith("event "):
+            status = _canonical_work_status(_arg_text(arguments, "status"))
+            if not target or not status:
                 return None
-            return f"!set-status {target.split(' ', 1)[1]} | {status}"
+            if action == "set_lifecycle" and target.startswith("event "):
+                return f"!set-status {target.split(' ', 1)[1]} | {status}"
+            if status in ("in_progress", "start"):
+                return f"!work start {target}{suffix}"
+            if status in ("completed", "done", "complete"):
+                return f"!work complete {target}{suffix}"
+            if target.startswith("event "):
+                return f"!set-status {target.split(' ', 1)[1]} | {status}"
+            return f"!work set-status {target} {status}"
         if action == "update_event":
             target = _resolve_target_reference(factory, {**target_arguments, "target_type": "event"})
             fields = arguments.get("fields")
@@ -1000,11 +1038,13 @@ def compile_intent(
     if capability == "reports.summary":
         return "!reports"
     if capability == "reports.progress":
-        target = _resolve_target_reference(factory, arguments)
-        return f"!reports progress {target}" if target else None
+        target_args = _target_arguments(arguments, text)
+        target_args["target_type"] = "event"
+        target = _resolve_target_reference(factory, target_args)
+        return f"!reports progress {target}" if target else "!reports"
     if capability == "reports.status":
         status = _arg_text(arguments, "status")
-        return f"!reports {status}" if status else None
+        return f"!reports {status}" if status else "!reports"
     if capability == "audit.list":
         return f"!audit {_arg_text(arguments, 'operation')}".strip()
 
@@ -1043,7 +1083,9 @@ def compile_intent(
 
     if capability.startswith("schema."):
         action = capability.split(".", 1)[1]
-        target = _resolve_target_reference(factory, arguments)
+        target_args = _target_arguments(arguments, text)
+        target_args["target_type"] = "event"
+        target = _resolve_target_reference(factory, target_args)
         if not target:
             return None
         fields = _arg_text(arguments, "fields")
@@ -2056,6 +2098,13 @@ def register(client, config: dict) -> Callable:
 
         self_jids = _self_jids(client, config)
         sender_jid = normalize_jid(message.Info.MessageSource.Sender)
+        push_name = str(getattr(message.Info, "Pushname", "") or "")
+        if push_name and config.get("db_session_factory"):
+            try:
+                from db.auth import authorize as _auth
+                _auth(config["db_session_factory"], sender_jid, "nl.identify", push_name=push_name)
+            except Exception:
+                pass
         explicit_self_target = bool(
             ME_ALIAS_RE.search(body) or EXPLICIT_SELF_TARGET_RE.search(body)
         )

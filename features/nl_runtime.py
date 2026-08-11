@@ -200,7 +200,11 @@ def entity_scope_is_missing(intent: dict, entity_candidates: list[dict]) -> bool
     arguments = intent.get("arguments", {})
     return not any(
         arguments.get(key)
-        for key in ("target_id", "target_name", "event_id", "task_id", "collection")
+        for key in (
+            "target_id", "target_name", "target", "event_id", "task_id", "collection",
+            # Named entity keys: model supplies these when user names an entity in text
+            "event_name", "task_name", "name", "event",
+        )
     )
 
 

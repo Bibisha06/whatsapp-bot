@@ -27,15 +27,203 @@ WORK_COMMANDS = ("!my", "!work", "!events", "!tasks", "!task",
 WORK_SUBCOMMANDS = {"assign", "unassign", "update", "edit", "history", "status", "set-status", "complete", "start", "create", "tasks", "reminders", "reminder", "schema"}
 
 
-def _format(row: dict) -> str:
+def _format(row: dict, display_names: dict[str, str] | None = None) -> str:
     typ = row["target_type"]
     ident = row.get("event_id") if typ == "event" else row.get("task_id")
-    who = f" @{row['user_jid'].split('@')[0]}" if row.get("user_jid") else " unassigned"
+    raw_jid = normalize_jid(row.get("user_jid")) if row.get("user_jid") else ""
+    clean_user = (display_names or {}).get(raw_jid) or (jid_user(raw_jid) if raw_jid else None)
+    who = f" @{clean_user}" if clean_user else " unassigned"
     due = f" | due {row['due_date'].strftime('%Y-%m-%d')}" if row.get("due_date") else ""
     progress = row.get("status") or "unassigned"
     event_kind = f" | {row['event_type']}/{row['event_category']}" if typ == "event" and row.get("event_type") else ""
     lifecycle = f" | lifecycle `{row['lifecycle_status']}`" if row.get("lifecycle_status") else ""
     return f"• `{typ} {ident}` *{row.get('title', row.get('name', ''))}* — `{progress}`{event_kind}{who}{due}{lifecycle}"
+
+
+def _text_value(value) -> str:
+    """Convert Neonize/protobuf scalar or nested values to clean text."""
+    if value is None:
+        return ""
+    # protobuf JID-like objects are not useful as names.
+    if getattr(value, "User", None) and getattr(value, "Server", None):
+        return ""
+    text = str(value).strip()
+    return text if text else ""
+
+
+def _object_name(obj) -> str:
+    """Extract a contact/profile name from whatever Neonize object is returned."""
+    if obj is None:
+        return ""
+
+    # These are the common WhatsApp/contact name fields across Neonize/WA
+    # protobuf versions. We deliberately do not write any of these to the DB.
+    for field in (
+        "DisplayName",
+        "PushName",
+        "Pushname",
+        "FullName",
+        "Name",
+        "Notify",
+        "VerifiedName",
+        "BusinessName",
+        "ShortName",
+    ):
+        value = getattr(obj, field, None)
+        text = _text_value(value)
+        if text:
+            return text
+
+    # Some protobuf/contact wrappers expose the useful data one level down.
+    for field in ("Contact", "User", "Info"):
+        nested = getattr(obj, field, None)
+        if nested is not None and nested is not obj:
+            name = _object_name(nested)
+            if name:
+                return name
+
+    return ""
+
+
+def _phone_for_jid(client, jid: str) -> str:
+    """Return a real phone JID for either a phone JID or a WhatsApp LID."""
+    normalized = normalize_jid(jid)
+    if not normalized:
+        return ""
+    if normalized.endswith("@s.whatsapp.net"):
+        return normalized
+    if normalized.endswith("@lid"):
+        try:
+            phone = normalize_jid(client.get_pn_from_lid(normalized))
+            if phone.endswith("@s.whatsapp.net"):
+                return phone
+        except Exception:
+            pass
+    return ""
+
+
+def _get_display_name_map(client, chat, jids) -> dict[str, str]:
+    """Resolve current WhatsApp/contact names without storing them in our DB.
+
+    The group Participant protobuf on this Neonize/WhatsApp session currently
+    returns DisplayName='', so relying only on Participants cannot work. We
+    therefore try, in order:
+      1. group participant DisplayName;
+      2. Neonize contact APIs, when available;
+      3. get_user_info() fields such as PushName/FullName;
+      4. the real phone number for LID users.
+
+    The returned mapping is temporary and exists only for formatting the
+    outgoing message. No name is persisted.
+    """
+    wanted = []
+    for jid in jids or []:
+        normalized = normalize_jid(jid)
+        if normalized and normalized not in wanted:
+            wanted.append(normalized)
+    if not wanted:
+        return {}
+
+    names: dict[str, str] = {}
+    phone_by_jid: dict[str, str] = {}
+    for jid in wanted:
+        phone = _phone_for_jid(client, jid)
+        if phone:
+            phone_by_jid[jid] = phone
+
+    # ------------------------------------------------------------
+    # 1. Group participant metadata.
+    # ------------------------------------------------------------
+    try:
+        info = client.get_group_info(chat)
+        participants = getattr(info, "Participants", []) or []
+        for participant in participants:
+            raw = getattr(participant, "JID", None) or getattr(participant, "LID", None)
+            participant_jid = normalize_jid(raw)
+            if not participant_jid:
+                continue
+            name = _object_name(participant)
+            phone_raw = re.sub(r"[^0-9]", "", str(getattr(participant, "PhoneNumber", "") or ""))
+            phone_jid = normalize_jid(f"{phone_raw}@s.whatsapp.net") if phone_raw else ""
+
+            if name:
+                if participant_jid in wanted:
+                    names[participant_jid] = name
+                if phone_jid in wanted:
+                    names[phone_jid] = name
+
+            if phone_jid:
+                for wanted_jid in wanted:
+                    if wanted_jid == phone_jid:
+                        phone_by_jid[wanted_jid] = phone_jid
+                    elif wanted_jid.endswith("@lid"):
+                        try:
+                            if normalize_jid(client.get_pn_from_lid(wanted_jid)) == phone_jid:
+                                phone_by_jid[wanted_jid] = phone_jid
+                        except Exception:
+                            pass
+    except Exception as exc:
+        log.info("Group participant name lookup failed: %s", exc)
+
+    # ------------------------------------------------------------
+    # 2. Try contact APIs exposed by the installed Neonize version.
+    # ------------------------------------------------------------
+    unresolved = [jid for jid in wanted if jid not in names]
+    contact_methods = ("get_contact", "get_contact_info")
+    for method_name in contact_methods:
+        method = getattr(client, method_name, None)
+        if not callable(method):
+            continue
+        for jid in list(unresolved):
+            candidates = [jid]
+            phone = phone_by_jid.get(jid) or _phone_for_jid(client, jid)
+            if phone and phone not in candidates:
+                candidates.append(phone)
+            for candidate in candidates:
+                try:
+                    obj = method(candidate)
+                    name = _object_name(obj)
+                    if name:
+                        names[jid] = name
+                        break
+                except Exception:
+                    continue
+        unresolved = [jid for jid in wanted if jid not in names]
+        if not unresolved:
+            break
+
+    # ------------------------------------------------------------
+    # 3. Neonize's known user-info API. It may expose PushName in some
+    # versions even though the current version's common fields are sparse.
+    # ------------------------------------------------------------
+    unresolved = [jid for jid in wanted if jid not in names]
+    get_user_info = getattr(client, "get_user_info", None)
+    if callable(get_user_info) and unresolved:
+        query_jids = []
+        for jid in unresolved:
+            query_jids.append(jid)
+            phone = phone_by_jid.get(jid) or _phone_for_jid(client, jid)
+            if phone and phone not in query_jids:
+                query_jids.append(phone)
+        try:
+            results = get_user_info(*query_jids)
+            for obj in list(results or []):
+                returned = normalize_jid(getattr(obj, "JID", None))
+                name = _object_name(obj)
+                if not name:
+                    continue
+                keys = [returned]
+                if returned.endswith("@lid"):
+                    phone = _phone_for_jid(client, returned)
+                    if phone:
+                        keys.append(phone)
+                for key in keys:
+                    if key in wanted:
+                        names[key] = name
+        except Exception as exc:
+            log.info("User-info name lookup failed: %s", exc)
+
+    return names
 
 
 def _parse(args: str):
@@ -114,19 +302,107 @@ def _reference(typ: str, ident: int, jid: str | None, sender: str, *, use_sender
     return f"{typ} {ident}" + (f" @{target_jid}" if target_jid else "")
 
 
-def _resolve_admin_target(store: WorkStore, typ: str, ident: int, jid: str | None) -> str:
+def _resolve_admin_target(store: WorkStore, typ: str, ident: int, jid: str | None) -> str | None:
     """Resolve an admin's target without silently choosing a user."""
     if jid:
         return jid
     rows = store.overview(admin=True, target_type=typ, target_id=ident)
     if not rows:
-        raise ValueError(f"no assignment exists for {typ} {ident}")
+        return None
     if len(rows) > 1:
         raise ValueError(f"mention the target user for {typ} {ident}; multiple users are assigned")
     return rows[0]["user_jid"]
 
 
-def _send(client, chat, text: str) -> None:
+def _send(client, chat, text: str, mention_jids: list[str] | None = None) -> None:
+    """Send text with real WhatsApp mention JIDs and transient display labels.
+
+    The database JID is never changed. Visible names are resolved at send time.
+    If WhatsApp does not expose a name, the real phone number is shown instead
+    of the internal LID.
+    """
+    seen: set[str] = set()
+    all_jids: list[str] = []
+
+    def _add(jid: str) -> None:
+        normalized = normalize_jid(jid)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            all_jids.append(normalized)
+
+    for jid in mention_jids or []:
+        _add(jid)
+
+    # Pick up literal @phone/@LID tokens already present in the text.
+    for match in re.finditer(
+        r"@(?:\+)?(\d{7,16})(?:@(s\.whatsapp\.net|lid))?\b",
+        text,
+    ):
+        number = match.group(1)
+        server = match.group(2) or "s.whatsapp.net"
+        _add(f"{number}@{server}")
+
+    if not all_jids:
+        client.send_message(chat, text)
+        return
+
+    # Resolve visible labels independently from the mention metadata.
+    display_names = _get_display_name_map(client, chat, all_jids)
+    resolved_mentions: list[str] = []
+
+    for original_jid in all_jids:
+        normalized = normalize_jid(original_jid)
+        resolved_jid = normalized
+        if normalized.endswith("@s.whatsapp.net"):
+            try:
+                lid = normalize_jid(client.get_lid_from_pn(normalized))
+                if lid.endswith("@lid"):
+                    resolved_jid = lid
+            except Exception:
+                pass
+
+        if resolved_jid not in resolved_mentions:
+            resolved_mentions.append(resolved_jid)
+
+        name = display_names.get(normalized) or display_names.get(resolved_jid)
+        if name:
+            label = name
+        else:
+            phone = _phone_for_jid(client, resolved_jid) or _phone_for_jid(client, normalized)
+            label = jid_user(phone or normalized)
+
+        # Replace both +LID/+phone and plain @LID/@phone forms.
+        original_user = jid_user(normalized)
+        resolved_user = jid_user(resolved_jid)
+        for user in dict.fromkeys((original_user, resolved_user)):
+            if not user:
+                continue
+            text = re.sub(
+                rf"@\+?{re.escape(user)}\b",
+                f"@{label}",
+                text,
+            )
+
+    try:
+        from neonize.proto.waE2E.WAWebProtobufsE2E_pb2 import (
+            ContextInfo,
+            ExtendedTextMessage,
+            Message,
+        )
+
+        proto_msg = Message(
+            extendedTextMessage=ExtendedTextMessage(
+                text=text,
+                contextInfo=ContextInfo(
+                    mentionedJID=resolved_mentions,
+                ),
+            ),
+        )
+        client.send_message(chat, proto_msg)
+        return
+    except Exception as exc:
+        log.info("Failed to send protobuf mention message: %s", exc)
+
     client.send_message(chat, text)
 
 
@@ -239,15 +515,18 @@ def _overview(client, chat, store: WorkStore, actor, sender: str, command: str, 
                 "user_jid": None,
                 "lifecycle_status": row.get("parent_event_status"),
             }
+    display_names = _get_display_name_map(
+        client, chat, [row.get("user_jid") for row in rows if row.get("user_jid")]
+    )
     lines = [heading]
     if events_by_id:
         lines += ["", "*Events*"]
         for event_id, event_row in events_by_id.items():
-            lines.append(_format(event_row))
+            lines.append(_format(event_row, display_names))
             for task_row in tasks_by_event.get(event_id, []):
-                lines.append("  └─ " + _format(task_row).lstrip())
+                lines.append("  └─ " + _format(task_row, display_names).lstrip())
     if standalone_tasks:
-        lines += ["", "*Tasks*"] + [_format(r) for r in standalone_tasks]
+        lines += ["", "*Tasks*"] + [_format(r, display_names) for r in standalone_tasks]
     totals = {s: sum(1 for r in rows if r.get("status") == s) for s in PROGRESS_STATUSES}
     lines += ["", "Totals: " + ", ".join(f"{s}={n}" for s, n in sorted(totals.items()))]
     _send(client, chat, "\n".join(lines))
@@ -278,19 +557,22 @@ def _handle_work_subcommand(client, chat, message, actor, sender: str, args: str
                 _send(client, chat, f"📭 No tasks found under event {event_id}.")
                 return True
             lines = [f"🧩 *Tasks under event {event_id}*"]
+            all_assignee_jids: list[str] = []
             for task in tasks:
                 assignments = WorkStore(factory).overview(
                     target_type="task", target_id=task.id, admin=True
                 )
+                assignee_jids = [row["user_jid"] for row in assignments if row.get("user_jid")]
+                all_assignee_jids.extend(assignee_jids)
                 assignees = ", ".join(
-                    f"@{row['user_jid'].split('@', 1)[0]}" for row in assignments
+                    f"@+{jid_user(j)}" for j in assignee_jids
                 ) or "unassigned"
                 due = f" | due {task.due_date.strftime('%Y-%m-%d')}" if task.due_date else ""
                 lines.append(
                     f"• `task {task.id}` *{task.title}* — `{task.status}` "
                     f"({task.priority}){due} | {assignees}"
                 )
-            _send(client, chat, "\n".join(lines))
+            _send(client, chat, "\n".join(lines), mention_jids=all_assignee_jids)
             return True
 
         if action in ("reminders", "reminder"):
@@ -359,8 +641,8 @@ def _handle_work_subcommand(client, chat, message, actor, sender: str, args: str
             # working alongside the shorter set/add/remove forms.
             verb = {"create": "set", "update": "add"}.get(verb.lower(), verb.lower())
             store_schema = SchemaStore(factory)
-            if verb in ("event", "task", "fields"):
-                head = rest if verb == "fields" else remainder
+            if verb in ("event", "task", "fields", "show", "view", "info"):
+                head = rest if verb in ("fields", "show", "view", "info") else remainder
                 typ, ident, _, _ = _target(head.split(), 0)
                 fields = store_schema.list_fields(ident)
                 if not fields:
@@ -420,9 +702,10 @@ def _handle_work_subcommand(client, chat, message, actor, sender: str, args: str
                 raise ValueError("mention at least one user or subgroup to assign or unassign")
             if action == "assign":
                 rows = store.assign_many(typ, ident, targets)
-                names = [row["user_jid"].split("@")[0] for row in rows]
+                assigned_jids = [row["user_jid"] for row in rows if row.get("user_jid")]
                 audit(factory, actor, f"{typ}.assign", "whatsapp", {"target_id": ident, "users": targets})
-                _send(client, chat, f"✅ Assigned `{typ} {ident}` to " + ", ".join(f"@{name}" for name in names) + ".")
+                visible = ", ".join(f"@+{jid_user(j)}" for j in assigned_jids)
+                _send(client, chat, f"✅ Assigned `{typ} {ident}` to {visible}.", mention_jids=assigned_jids)
             else:
                 removed = store.unassign_many(typ, ident, targets)
                 audit(factory, actor, f"{typ}.unassign", "whatsapp", {"target_id": ident, "users": removed})
@@ -466,7 +749,7 @@ def _handle_work_subcommand(client, chat, message, actor, sender: str, args: str
                     target_jid = _resolve_admin_target(store, typ, ident, target_jid)
                 rows = store.overview(user_jid=None if is_admin else sender, admin=is_admin,
                                       target_type=typ, target_id=ident, assignee_jid=target_jid)
-                _send(client, chat, "\n".join([f"📌 *{typ.title()} {ident}*"] + ([_format(row) for row in rows] if rows else ["📭 No assignment found."])))
+                _send(client, chat, "\n".join([f"📌 *{typ.title()} {ident}*"] + ([_format(row, _get_display_name_map(client, chat, [r.get("user_jid") for r in rows if r.get("user_jid")])) for row in rows] if rows else ["📭 No assignment found."])))
                 return True
             if not is_admin and action == "set-status":
                 _send(client, chat, "⛔ Use `!work complete` or update your own work; administrators set explicit statuses.")
@@ -507,7 +790,8 @@ def handle(client, message, session_factory) -> bool:
     command = command.lower()
     if command not in WORK_COMMANDS:
         return False
-    actor = gate(session_factory, source.Sender, client, chat, "member", f"work.{command[1:]}")
+    push_name = str(getattr(message.Info, "Pushname", "") or "")
+    actor = gate(session_factory, source.Sender, client, chat, "member", f"work.{command[1:]}", push_name=push_name)
     if not actor:
         return True
     sender = normalize_jid(source.Sender)
@@ -529,8 +813,9 @@ def handle(client, message, session_factory) -> bool:
             store = WorkStore(session_factory)
             if command == "!assign":
                 rows = store.assign_many(typ, int(ident_token), targets)
-                names = [row["user_jid"].split("@")[0] for row in rows]
-                _send(client, chat, f"✅ Assigned `{typ} {ident_token}` to " + ", ".join(f"@{name}" for name in names) + ".")
+                assigned_jids = [row["user_jid"] for row in rows if row.get("user_jid")]
+                visible = ", ".join(f"@+{jid_user(j)}" for j in assigned_jids)
+                _send(client, chat, f"✅ Assigned `{typ} {ident_token}` to {visible}.", mention_jids=assigned_jids)
             else:
                 removed = store.unassign_many(typ, int(ident_token), targets)
                 _send(client, chat, f"✅ Removed {len(removed)} assignment(s)." if removed else "📭 Assignment not found.")

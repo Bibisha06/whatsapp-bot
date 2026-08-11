@@ -51,8 +51,19 @@ def _cmd_progress(client, chat, store: ReportStore, args: str) -> None:
     if not data["rows"]:
         client.send_message(chat, f"📭 Nobody is assigned to *{data['event_name']}* yet.")
         return
-    client.send_message(chat, f"📊 *{data['event_name']}* — {len(data['rows'])} assigned\n"
-                              + _table(data["fields"], data["rows"]))
+    # Build a simple readable list instead of (or alongside) the table
+    lines = [f"📊 *{data['event_name']}* — {len(data['rows'])} assignment(s)", ""]
+    for row in data["rows"]:
+        scope = row.get("scope", "")
+        scope_label = f" _(via {scope})_" if scope else ""
+        status_label = f"`{row['status']}`"
+        task_title = row.get("values", {}).get("task", "")
+        task_label = f" — _{task_title}_" if task_title else ""
+        lines.append(f"• *{row['name']}*{scope_label}{task_label} — {status_label}")
+    if data["fields"]:
+        lines.append("")
+        lines.append(_table([f for f in data["fields"] if f != "task"], data["rows"]))
+    client.send_message(chat, "\n".join(lines))
 
 
 def _cmd_status_list(client, chat, store: ReportStore, status: str) -> None:

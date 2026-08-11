@@ -81,7 +81,7 @@ class WorkStore:
         return next((row for row in rows if jid_user(row.user_jid) == wanted), None)
 
     @staticmethod
-    def _row(row: Assignment, target=None, parent=None) -> dict:
+    def _row(row: Assignment, target=None, parent=None, session: Session | None = None) -> dict:
         result = {
             "id": row.id, "assignment_id": row.id, "target_type": row.target_type,
             "event_id": row.event_id, "task_id": row.task_id, "user_jid": row.user_jid,
@@ -90,6 +90,9 @@ class WorkStore:
             "last_update_at": row.last_update_at, "created_at": row.created_at,
         }
         result["target_id"] = row.event_id if row.target_type == "event" else row.task_id
+        if session is not None:
+            user = session.get(User, row.user_jid)
+            result["display_name"] = (user.display_name if user and user.display_name else row.user_jid.split("@", 1)[0])
         if isinstance(target, Event):
             result.update(name=target.name, title=target.name, lifecycle_status=target.status,
                           event_type=target.type, event_category=target.category, due_date=target.end_date)
@@ -266,7 +269,7 @@ class WorkStore:
                                      row.event_id if row.target_type == "event" else row.task_id)
                 if target is None or getattr(target, "deleted_at", None) is not None: continue
                 parent = session.get(Event, target.event_id) if isinstance(target, Task) and target.event_id else None
-                result.append(self._row(row, target, parent))
+                result.append(self._row(row, target, parent, session=session))
             return result
 
     def unassigned(self, *, target_type: str | None = None) -> list[dict]:
